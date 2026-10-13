@@ -1,0 +1,10 @@
+{
+  "by_mac": {
+    "AA:BB:CC:DD:EE:FF": {
+      "flags": ["--wfd-go-intent", "15"]
+    }
+  },
+  "by_name": [
+    { "match": "^MyTV", "flags": ["--wfd-aosp-pmt-pid"] }
+  ]
+}
