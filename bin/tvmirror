@@ -1,0 +1,1180 @@
+#!/usr/bin/env python3
+"""
+tvmirror — cast your Linux desktop to a TV/Android TV over Miracast (WFD).
+
+Wraps FluxCast (https://github.com/IlyaP358/fluxcast) with the lessons that
+actually cost time on Hyprland:
+
+  * Chooses the CAPTURE BACKEND per compositor. Hyprland must use `portal`;
+    anything that defaults to `x11grab` captures the XWayland root window,
+    which is pure BLACK on a native Wayland session (measured: 9KB, luma 0).
+    Symptom is a black TV with a live cursor, because the cursor arrives as
+    HID input events rather than video.
+  * Runs FluxCast's --doctor first and refuses to start on a hard failure.
+  * Verifies the capture path is NOT black before pushing video to the TV.
+  * Remembers the TV peer so you don't rescan every time.
+
+Modes:
+  tvmirror                 interactive TUI (peer picker + status)
+  tvmirror run             connect to the chosen peer
+    --peer <MAC>           skip the wrapper scan and connect to this sink
+    --last                 reuse the most recently used sink
+    --auto-fix             if the session dies early, retry with known sink workarounds
+                           and remember whichever flags finally worked (per sink)
+    --encoder auto|vaapi|nvenc|x264   hardware H.264 (needs a FluxCast with --wfd-encoder)
+  tvmirror doctor          show the full capability report (--fresh bypasses the cache)
+  tvmirror scan            list visible Miracast sinks
+  tvmirror test            send the test pattern (proves transport works)
+  tvmirror list            show saved peers
+  tvmirror save <MAC> [name]  remember a peer
+  tvmirror profile                    show per-sink flag profiles
+  tvmirror profile-set <MAC> -- <fluxcast flags>   pin flags for one sink
+  tvmirror profile-forget <MAC>       drop a sink profile
+  tvmirror display         create/remove a Hyprland virtual display
+  tvmirror backend         print the capture backend for this compositor
+
+Sink profiles live in ~/.config/tvmirror/profiles.json. Hand-written rules match a
+sink by name regex: {"by_name": [{"match": "^MyTV", "flags": ["--wfd-go-intent","15"]}]}
+
+--auto-fix only helps when the session DIES. A sink that connects and stays black
+needs a manual flag (e.g. `-- --wfd-aosp-pmt-pid`); pin it with profile-set.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+FLUX_DEFAULT = Path.home() / ".local" / "share" / "tvmirror" / "fluxcast"
+
+# Where FluxCast might live, most-specific first. The wrapper is usually
+# installed to ~/.local/bin, so we must NOT resolve relative to __file__.
+FLUX_CANDIDATES = [
+    Path(os.environ["TVMIRROR_FLUXCAST"]) if os.environ.get("TVMIRROR_FLUXCAST") else None,
+    FLUX_DEFAULT,
+    Path.home() / ".hermes" / "cache" / "scratch" / "fluxcast",
+    Path.home() / "fluxcast",
+    Path.home() / "src" / "fluxcast",
+    Path("/opt/fluxcast"),
+    Path.cwd() / "fluxcast",
+    Path(__file__).resolve().parent / "fluxcast",
+]
+
+CONFIG = Path(os.environ.get("TVMIRROR_CONFIG", Path.home() / ".config" / "tvmirror"))
+PEERS_FILE = CONFIG / "peers.json"
+PROFILES_FILE = CONFIG / "profiles.json"
+CACHE = Path(os.environ.get("TVMIRROR_CACHE", Path.home() / ".cache" / "tvmirror"))
+DOCTOR_CACHE = CACHE / "doctor.json"
+DOCTOR_TTL = int(os.environ.get("TVMIRROR_DOCTOR_TTL", "90"))   # seconds
+STABLE_SECONDS = int(os.environ.get("TVMIRROR_STABLE_SECONDS", "20"))  # alive this long == "worked"
+
+# ---------------------------------------------------------------- styling ----
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    CYAN = "\033[36m"
+    MAGENTA = "\033[35m"
+
+    @classmethod
+    def disable(cls) -> None:
+        for k in ("RESET", "BOLD", "DIM", "RED", "GREEN", "YELLOW", "BLUE", "CYAN", "MAGENTA"):
+            setattr(cls, k, "")
+
+
+def tui_on() -> bool:
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        return False
+    return os.environ.get("TERM", "") not in ("", "dumb")
+
+
+if not tui_on():
+    C.disable()
+
+
+def hdr(text: str) -> None:
+    print(f"{C.CYAN}{C.BOLD}{'━' * 4}{C.RESET} {C.BOLD}{text}{C.RESET}")
+
+
+def ok(text: str) -> None:
+    print(f"  {C.GREEN}✓{C.RESET} {text}")
+
+
+def warn(text: str) -> None:
+    print(f"  {C.YELLOW}!{C.RESET} {text}")
+
+
+def bad(text: str) -> None:
+    print(f"  {C.RED}✗{C.RESET} {text}")
+
+
+def info(text: str) -> None:
+    print(f"  {C.DIM}·{C.RESET} {text}")
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"\n{C.RED}{C.BOLD}error{C.RESET} {msg}\n", file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------ compositor ----
+def detect_compositor() -> tuple[str, str]:
+    """Return (compositor, recommended_capture_backend)."""
+    envs = {k: v for k, v in os.environ.items()}
+    if envs.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "hyprland", "portal"
+    if envs.get("SWAYSOCK"):
+        return "sway", "wf-recorder"
+    if envs.get("KDE_FULL_SESSION") or envs.get("XDG_CURRENT_DESKTOP") == "KDE":
+        return "kde", "portal"
+    if (envs.get("XDG_CURRENT_DESKTOP") or "").lower() == "gnome":
+        return "gnome", "portal"
+    if envs.get("WAYLAND_DISPLAY"):
+        return "wayland-other", "portal"
+    if envs.get("DISPLAY"):
+        return "x11", "x11grab"
+    return "unknown", "auto"
+
+
+def backend_note(compositor: str) -> str:
+    return {
+        "hyprland": "portal — x11grab yields a BLACK frame on Hyprland",
+        "sway": "wf-recorder — native wlroots screencopy",
+        "kde": "portal — xdg-desktop-portal-kde",
+        "gnome": "portal — Mutter screencast via PipeWire",
+        "x11": "x11grab — X11 root window",
+    }.get(compositor, "portal — default for Wayland")
+
+
+# --------------------------------------------------------------- helpers ----
+def find_flux() -> Path | None:
+    """Locate a FluxCast checkout across the known install locations."""
+    seen = set()
+    for cand in FLUX_CANDIDATES:
+        if cand is None:
+            continue
+        try:
+            c = cand.expanduser().resolve()
+        except Exception:
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        for entry in (c / "src" / "main.py", c / "main.py"):
+            if entry.exists():
+                return c
+    return None
+
+
+def flux_entry() -> Path:
+    root = find_flux()
+    if root is None:
+        tried = "\n".join(
+            f"    {c.expanduser()}" for c in FLUX_CANDIDATES if c is not None)
+        die(
+            "FluxCast not found.\n"
+            f"  looked in:\n{tried}\n\n"
+            "  fix: git clone --depth 1 https://github.com/IlyaP358/fluxcast.git \\\n"
+            "         ~/.local/share/tvmirror/fluxcast\n"
+            "  or:  export TVMIRROR_FLUXCAST=/path/to/fluxcast"
+        )
+    return root / "src" / "main.py" if (root / "src" / "main.py").exists() else root / "main.py"
+
+
+def run_flux(args: list[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+    entry = flux_entry()
+    cmd = [sys.executable, str(entry), *args]
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+
+
+def parse_doctor(stdout: str) -> dict[str, tuple[str, str]]:
+    out: dict[str, tuple[str, str]] = {}
+    for line in stdout.splitlines():
+        m = re.match(r"\s{2,}(ok|warn|fail)\s{1,}(\S.*?)\s{2,}(.*)$", line)
+        if m:
+            out[m.group(2).strip()] = (m.group(1), m.group(3).strip())
+    return out
+
+
+def _doctor_cache_load(now: float | None = None) -> dict[str, tuple[str, str]] | None:
+    """Return a cached doctor report if fresh. A cache hit saves up to ~2 min."""
+    now = time.time() if now is None else now
+    try:
+        blob = json.loads(DOCTOR_CACHE.read_text())
+        if now - float(blob["ts"]) <= DOCTOR_TTL and blob.get("env") == _doctor_env_key():
+            return {k: (v[0], v[1]) for k, v in blob["report"].items()}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _doctor_env_key() -> str:
+    # Invalidate when the session changes (different compositor, display, user).
+    return "|".join(os.environ.get(k, "") for k in (
+        "XDG_CURRENT_DESKTOP", "WAYLAND_DISPLAY", "DISPLAY",
+        "HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK"))
+
+
+def _doctor_cache_store(rep: dict[str, tuple[str, str]], now: float | None = None) -> None:
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        DOCTOR_CACHE.write_text(json.dumps(
+            {"ts": time.time() if now is None else now,
+             "env": _doctor_env_key(), "report": rep}))
+    except OSError:
+        pass
+
+
+def doctor_report(fresh: bool = False) -> dict[str, tuple[str, str]]:
+    """
+    Parse FluxCast --doctor into {check: (status, details)}.
+    Check names can contain spaces ('iw P2P', 'screen capture', 'ffmpeg encoders'),
+    so split on the FIRST whitespace run after the status token only.
+    Cached for DOCTOR_TTL seconds (bypass with --fresh).
+    """
+    if not fresh:
+        cached = _doctor_cache_load()
+        if cached is not None:
+            return cached
+    r = run_flux(["--doctor"], timeout=120)
+    if r.returncode != 0 and not r.stdout:
+        die(f"could not run --doctor: {r.stderr.strip() or r.returncode}")
+    out = parse_doctor(r.stdout)
+    if out and not any(s == "fail" for s, _ in out.values()):
+        _doctor_cache_store(out)       # never cache a failing report
+    return out
+
+
+def parse_peers(stdout: str) -> list[dict]:
+    """Parse [FluxCast WFD] peer listing output."""
+    peers = []
+    for line in stdout.splitlines():
+        m = re.search(r"\[\d+\]\s+([0-9A-Fa-f:]{17})\s+(.+?)(?:\s+via\s+\w+)?\s*$", line)
+        if m:
+            mac, name = m.group(1).upper(), m.group(2).strip()
+            wfd = "WFD capability data detected" in stdout
+            peers.append({"mac": mac, "name": name, "wfd": wfd})
+    return peers
+
+
+def scan_peers() -> list[dict]:
+    r = run_flux(["--wfd-scan"], timeout=180)
+    if r.returncode != 0:
+        bad(f"scan failed: {r.stderr.strip()[:200]}")
+        return []
+    return parse_peers(r.stdout)
+
+
+# -------------------------------------------------------------- encoders ----
+# GStreamer elements that do H.264 in hardware, best-first. FluxCast's portal
+# pipeline used to hard-code x264; claiming "NVENC available" because ffmpeg
+# *lists* an encoder was misleading, since nothing used it.
+HW_GST_ENCODERS = ("vah264enc", "nvh264enc", "qsvh264enc", "vaapih264enc")
+
+
+def probe_hw_encoders(run: Callable[..., subprocess.CompletedProcess] | None = None) -> list[str]:
+    """Names of hardware H.264 GStreamer elements that actually exist here."""
+    if not shutil.which("gst-inspect-1.0"):
+        return []
+    run = run or subprocess.run
+    found = []
+    for name in HW_GST_ENCODERS:
+        try:
+            r = run(["gst-inspect-1.0", name], capture_output=True, text=True, timeout=15)
+        except Exception:
+            continue
+        if r.returncode == 0:
+            found.append(name)
+    return found
+
+
+_flux_help: str | None = None
+
+
+def flux_supports(flag: str) -> bool:
+    """Does this FluxCast checkout know `flag`? Lets the wrapper stay compatible
+    with stock upstream and with the patched tree."""
+    global _flux_help
+    if _flux_help is None:
+        r = run_flux(["--help"], timeout=30)
+        _flux_help = (r.stdout or "") + (r.stderr or "")
+    return flag in _flux_help
+
+
+def describe_encoders() -> None:
+    hw = probe_hw_encoders()
+    if not hw:
+        info("software H.264 (x264) — no GStreamer hardware encoder found")
+        return
+    ok(f"hardware H.264 encoder(s) present: {', '.join(hw)}")
+    if flux_supports("--wfd-encoder"):
+        info("try:  tvmirror run --encoder auto   (falls back to x264 if it fails)")
+    else:
+        info("this FluxCast build encodes with x264 only — hardware is NOT being used")
+
+
+# ---------------------------------------------------------- sink profiles ----
+# Miracast sinks differ wildly. Rather than hard-coding brands, the wrapper keeps
+# a profile per sink: extra FluxCast flags that are known to work for it.
+#   by_mac   exact match, written automatically when a fixed-up run succeeds
+#   by_name  [{"match": "<regex>", "flags": [...], "note": "..."}] hand-written
+# Nothing here is vendor-specific; it is yours to extend.
+FIX_LADDER: list[tuple[list[str], str]] = [
+    ([], "defaults"),
+    (["--wfd-p2p-backend", "wpas"], "talk to wpa_supplicant directly"),
+    (["--wfd-p2p-backend", "wpas", "--wfd-p2p-channel", "6"],
+     "pin the P2P group to 2.4 GHz channel 6"),
+    (["--wfd-go-intent", "15"], "make this machine the P2P group owner"),
+    (["--wfd-go-intent", "0", "--wfd-aosp-pmt-pid"], "sink-owned group + Android-style TS tables"),
+    (["--fps", "30", "--output-res", "1280x720"], "degrade to 720p30 (last resort)"),
+]
+
+
+def load_profiles() -> dict:
+    data: dict = {}
+    if PROFILES_FILE.exists():
+        try:
+            data = json.loads(PROFILES_FILE.read_text())
+        except json.JSONDecodeError:
+            warn("profiles.json corrupt, ignoring it")
+    data.setdefault("by_mac", {})
+    data.setdefault("by_name", [])
+    return data
+
+
+def save_profiles(data: dict) -> None:
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    PROFILES_FILE.write_text(json.dumps(data, indent=2))
+
+
+def resolve_profile(mac: str, name: str, profiles: dict) -> tuple[list[str], str]:
+    """(flags, source). Exact MAC beats name regex; first matching regex wins."""
+    hit = profiles["by_mac"].get(mac.upper())
+    if hit and hit.get("flags"):
+        return list(hit["flags"]), f"saved for {mac.upper()}"
+    for rule in profiles["by_name"]:
+        try:
+            if re.search(rule["match"], name or "", re.IGNORECASE) and rule.get("flags"):
+                return list(rule["flags"]), f"name rule /{rule['match']}/"
+        except (re.error, KeyError, TypeError):
+            continue
+    return [], ""
+
+
+def plan_attempts(profile_flags: list[str], auto_fix: bool) -> list[tuple[list[str], str]]:
+    """Ordered (flags, label) list. Without --auto-fix there is exactly one attempt."""
+    plan: list[tuple[list[str], str]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def add(flags: list[str], label: str) -> None:
+        key = tuple(flags)
+        if key not in seen:
+            seen.add(key)
+            plan.append((flags, label))
+
+    if profile_flags:
+        add(profile_flags, "saved profile")
+    else:
+        add([], "defaults")
+    if auto_fix:
+        for flags, label in FIX_LADDER:
+            add(flags, label)
+    return plan
+
+
+def learn_profile(mac: str, name: str, flags: list[str]) -> None:
+    """Remember flags that produced a stable session. Defaults aren't recorded."""
+    if not flags:
+        return
+    data = load_profiles()
+    data["by_mac"][mac.upper()] = {"name": name, "flags": flags, "learned": int(time.time())}
+    save_profiles(data)
+    ok(f"remembered working flags for {name or mac}: {' '.join(flags)}")
+
+
+def run_stream(cmd: list[str],
+               popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
+               clock: Callable[[], float] = time.monotonic) -> tuple[int, float, bool]:
+    """Run one FluxCast session. Returns (returncode, seconds_alive, user_interrupted)."""
+    start = clock()
+    proc = popen(cmd)
+    try:
+        rc = proc.wait()
+        interrupted = False
+    except KeyboardInterrupt:
+        interrupted = True
+        try:
+            proc.send_signal(2)
+            rc = proc.wait(timeout=15)
+        except Exception:
+            proc.kill()
+            rc = 130
+    return rc, clock() - start, interrupted
+
+
+def session_ok(rc: int, seconds: float, interrupted: bool) -> bool:
+    return interrupted or rc == 0 or seconds >= STABLE_SECONDS
+
+
+# ----------------------------------------------------------------- config ----
+def load_peers() -> dict:
+    if PEERS_FILE.exists():
+        try:
+            return json.loads(PEERS_FILE.read_text())
+        except json.JSONDecodeError:
+            warn("peers.json corrupt, starting fresh")
+    return {}
+
+
+def save_peer(mac: str, name: str) -> None:
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    data = load_peers()
+    data[mac.upper()] = {"name": name, "last_used": int(time.time())}
+    PEERS_FILE.write_text(json.dumps(data, indent=2))
+    ok(f"saved {name} ({mac.upper()}) to {PEERS_FILE}")
+
+
+def last_peer() -> dict | None:
+    data = load_peers()
+    if not data:
+        return None
+    return max(data.items(), key=lambda kv: kv[1].get("last_used", 0))
+
+
+# ------------------------------------------------------------------ checks ----
+def capture_is_black() -> bool | None:
+    """
+    True if the compositor's native capture returns a genuinely BLANK frame.
+
+    This is the exact Hyprland+x11grab trap. Returns None if undeterminable.
+
+    Do NOT judge by mean brightness: a dark-themed desktop (terminal, editor)
+    averages to a very low luma and reads as a false positive. A truly blank
+    frame is UNIFORM. So scale to a small grid and test the MAXIMUM luma —
+    any content at all produces a non-zero maximum, while a blank frame is 0.
+    """
+    if not shutil.which("ffmpeg"):
+        return None
+    comp, backend = detect_compositor()
+    tmp = Path("/tmp/tvmirror_capcheck.png")
+
+    # Sample a 32x32 gray grid: enough pixels to prove content exists,
+    # small enough to be near-instant.
+    vf = "scale=32:32:flags=area,format=gray"
+
+    try:
+        if comp in ("hyprland", "wayland-other") and shutil.which("grim"):
+            grab = subprocess.run(["grim", "-"], capture_output=True, timeout=25)
+            if grab.returncode != 0 or not grab.stdout:
+                return None
+            proc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-f", "image2pipe", "-i", "pipe:0",
+                 "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                input=grab.stdout, capture_output=True, timeout=30)
+        elif os.environ.get("DISPLAY"):
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-f", "x11grab", "-video_size", "1920x1080",
+                 "-i", ":0", "-frames:v", "1", "-y", str(tmp)],
+                capture_output=True, timeout=30)
+            if not tmp.exists():
+                return None
+            proc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-i", str(tmp), "-vf", vf,
+                 "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                capture_output=True, timeout=30)
+        else:
+            return None
+
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        px = proc.stdout[:1024]
+        if len(px) < 64:          # too small to be a real 32x32 grid
+            return None
+        # A blank frame is uniformly zero. Any content => a non-zero pixel.
+        return max(px) == 0
+    except Exception:
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def preflight(fresh: bool = False) -> tuple[str, str]:
+    """Gate on doctor + black-capture. Returns (compositor, backend)."""
+    comp, backend = detect_compositor()
+    hdr("preflight")
+
+    rep = doctor_report(fresh=fresh)
+    fails = [k for k, (s, _) in rep.items() if s == "fail"]
+    warns = [k for k, (s, _) in rep.items() if s == "warn"]
+
+    def lookup(prefix: str) -> tuple[str, str]:
+        """Find a doctor row by prefix, tolerant of upstream renames."""
+        for k, v in rep.items():
+            if k.lower().startswith(prefix.lower()):
+                return v
+        return ("warn", "")
+
+    p2p = lookup("iw P2P")[0]
+    cap = lookup("screen capture")[0]
+
+    ok(f"compositor: {comp}")
+    info(f"capture backend → {backend} ({backend_note(comp)})")
+
+    if cap == "ok":
+        ok("screen capture available")
+    else:
+        bad("no screen capture backend found")
+
+    if p2p == "ok":
+        ok("Wi-Fi Direct (P2P) available")
+    else:
+        bad("no P2P-device interface — Miracast cannot work")
+        die("P2P is required. Check `nmcli device status | grep p2p`.")
+
+    describe_encoders()
+
+    for w in warns:
+        info(f"warn: {w} — {rep[w][1][:70]}")
+
+    if backend in ("portal", "wf-recorder"):
+        black = capture_is_black()
+        if black is True:
+            bad("native capture returns a BLACK frame")
+            if backend == "portal" and comp == "hyprland":
+                die(
+                    "portal capture is black. Ensure xdg-desktop-portal-hyprland is running:\n"
+                    "    systemctl --user status xdg-desktop-portal-hyprland",
+                )
+            die("capture is black — the TV would show black with a live cursor.")
+        if black is False:
+            ok("capture verified non-black")
+    elif backend == "x11grab":
+        warn("x11grab on a Wayland session captures BLACK — using it only on X11")
+
+    if fails:
+        die("hard failures in doctor: " + ", ".join(fails))
+
+    return comp, backend
+
+
+# ------------------------------------------------------- virtual display ----
+# WHY THIS EXISTS: capturing the laptop's own panel (eDP-1) via the Hyprland
+# portal flatlines — the sender's tx counter freezes (observed 165→1070 KiB
+# across three attempts) and the TV drops the session. eDP-1 is 1920x1080@144Hz
+# XRGB8888 with direct-scanout/software-render fallbacks, i.e. the hardware
+# buffer path that fails. A Hyprland headless output is a plain virtual display
+# with its own workspace, and capturing it works. It is also a REAL second
+# display, so windows can be moved onto it and streamed — the "TV as another
+# display" outcome, with no HDMI cable.
+
+def hypr(*args: str) -> str:
+    try:
+        r = subprocess.run(["hyprctl", *args], capture_output=True, text=True, timeout=20)
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def headless_outputs() -> list[str]:
+    out = hypr("monitors", "all")
+    names = []
+    for line in out.splitlines():
+        if line.startswith("Monitor "):
+            m = re.match(r"Monitor (\S+) \(ID", line)
+            if m and m.group(1).upper().startswith("HEADLESS"):
+                names.append(m.group(1))
+    return names
+
+
+def ensure_headless(width: int = 1920, height: int = 1080, refresh: int = 60) -> str | None:
+    """Guarantee exactly one Hyprland headless output; return its name."""
+    names = headless_outputs()
+    if not names:
+        if "ok" not in hypr("output", "create", "headless").lower():
+            bad("could not create a headless output")
+            return None
+        time.sleep(2.5)
+        names = headless_outputs()
+        if not names:
+            bad("headless output did not appear")
+            return None
+        ok(f"created virtual display {names[0]} ({width}x{height}@{refresh})")
+    keep = names[0]
+    for extra in names[1:]:
+        hypr("output", "remove", extra)
+    return keep
+
+
+def drop_headless() -> list[str]:
+    removed = []
+    for n in headless_outputs():
+        hypr("output", "remove", n)
+        removed.append(n)
+    return removed
+
+
+def cmd_display(args: argparse.Namespace) -> int:
+    """Manage the virtual display used for TV streaming."""
+    hdr("virtual display")
+    names = headless_outputs()
+    if args.remove:
+        gone = drop_headless()
+        if gone:
+            ok(f"removed {', '.join(gone)}")
+        else:
+            info("none to remove")
+        return 0
+    if not args.create_display and names:
+        ok(f"exists: {', '.join(names)}")
+        info("streaming: pick this output in the portal dialog (not the laptop panel)")
+        return 0
+    n = ensure_headless(args.width, args.height, args.refresh)
+    if not n:
+        return 1
+    ok(f"ready: {n} ({args.width}x{args.height}@{args.refresh})")
+    info(f"move a window onto it, then `tvmirror run` and select {n} in the dialog")
+    return 0
+
+
+# ------------------------------------------------------------- streaming ----
+def do_run(mac: str | None, extra: list[str], test_pattern: bool = False,
+           latency_log: bool = False, dry: bool = False,
+           auto_fix: bool = False, rescan: bool = False,
+           fresh: bool = False) -> int:
+    # P2P contention guard runs FIRST and only on a real connect attempt.
+    # Deliberately NOT in scan/doctor/test paths: a diagnostic must never
+    # seize or tear down a live P2P group.
+    if not dry:
+        guard_single_sender()
+        print()
+
+    comp, backend = preflight(fresh=fresh)
+    print()
+
+    hdr("peers")
+    saved = load_peers()
+    if mac and not dry and not rescan:
+        # FluxCast scans for the peer itself. Scanning here first doubles the
+        # connect time and the P2P device is busy during the first scan.
+        chosen = {"mac": mac.upper(), "name": saved.get(mac.upper(), {}).get("name", mac.upper()),
+                  "wfd": True}
+        info("peer given: skipping the wrapper scan (use --rescan to check visibility first)")
+        peers = [chosen]
+    else:
+        peers = scan_peers()
+    if not peers:
+        bad("no Miracast sinks found")
+        info("Put the TV in screen-mirroring receive mode (menu name varies by brand:")
+        info("Screen Mirroring / Screen Share / Smart View / Miracast / Wireless Display)")
+        die("no peers to connect to", 2)
+
+    chosen = None
+    if mac:
+        chosen = next((p for p in peers if p["mac"].upper() == mac.upper()), None)
+        if not chosen:
+            die(f"{mac.upper()} not found. Visible: " +
+                ", ".join(p["mac"] for p in peers), 2)
+    elif len(peers) == 1:
+        chosen = peers[0]
+    else:
+        for i, p in enumerate(peers):
+            mark = " (saved)" if p["mac"].upper() in saved else ""
+            wfd = f"{C.GREEN}[WFD]{C.RESET}" if p["wfd"] else f"{C.YELLOW}[no WFD]{C.RESET}"
+            print(f"  [{i}] {p['name']}  {wfd}  {p['mac']}{mark}")
+        if not sys.stdin.isatty():
+            die("multiple peers and no --peer given", 2)
+        idx = input("\n  select index> ").strip()
+        if not idx.isdigit() or not 0 <= int(idx) < len(peers):
+            die("invalid selection", 2)
+        chosen = peers[int(idx)]
+
+    if chosen is None or chosen["mac"] == "00:00:00:00:00:00":
+        die("no usable peer selected", 2)
+
+    ok(f"target: {chosen['name']} ({chosen['mac']})")
+    if not chosen["wfd"]:
+        warn("peer did not advertise WFD capability data — may fail")
+    save_peer(chosen["mac"], chosen["name"])
+
+    if dry:
+        info("--dry-run: preflight + scan passed; not connecting")
+        return 0
+
+    # Only genuinely-passthrough flags go to fluxcast; ours must not leak through.
+    extra = [e for e in extra if e not in ("--dry-run", "--peer", "--latency-log")]
+
+    base = ["--protocol", "wfd", "--wfd-peer", chosen["mac"],
+            "--wfd-capture-backend", backend]
+    if test_pattern:
+        base.append("--wfd-test-pattern")
+        hdr("test pattern")
+        info("sending synthetic pattern — proves transport, not your screen")
+    if latency_log:
+        base.append("--wfd-latency-log")
+    base += extra
+
+    profile_flags, source = resolve_profile(chosen["mac"], chosen["name"], load_profiles())
+    if profile_flags:
+        info(f"sink profile ({source}): {' '.join(profile_flags)}")
+    plan = plan_attempts(profile_flags, auto_fix)
+
+    hdr("streaming")
+    info(f"backend={backend}  peer={chosen['mac']}  ctrl-c to stop")
+    if auto_fix:
+        info(f"--auto-fix: up to {len(plan)} attempts; a session that lives "
+             f">{STABLE_SECONDS}s counts as working")
+    print()
+
+    rc = 1
+    for i, (flags, label) in enumerate(plan):
+        if i:
+            hdr(f"retry {i}/{len(plan) - 1}: {label}")
+            teardown_stale_groups()
+        rc, secs, interrupted = run_stream([sys.executable, str(flux_entry()), *base, *flags])
+        if session_ok(rc, secs, interrupted):
+            if flags and flags != profile_flags:
+                learn_profile(chosen["mac"], chosen["name"], flags)
+            return 0 if interrupted else rc
+        warn(f"session ended after {secs:.0f}s (rc={rc})")
+    if auto_fix:
+        bad("every attempt failed — run `tvmirror doctor --fresh` and see the notes in `tvmirror --help`")
+    return rc
+
+
+def cmd_profile() -> int:
+    hdr("sink profiles")
+    data = load_profiles()
+    if not data["by_mac"] and not data["by_name"]:
+        info("none yet — `run --auto-fix` records what works; or `profile-set <MAC> -- <flags>`")
+        return 0
+    for mac, meta in data["by_mac"].items():
+        print(f"  {meta.get('name', '')}  {mac}  {' '.join(meta.get('flags', []))}")
+    for rule in data["by_name"]:
+        print(f"  name /{rule.get('match')}/  {' '.join(rule.get('flags', []))}"
+              f"  {C.DIM}{rule.get('note', '')}{C.RESET}")
+    return 0
+
+
+def cmd_profile_set(mac: str | None, flags: list[str]) -> int:
+    if not mac or not re.fullmatch(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}", mac):
+        die("usage: tvmirror profile-set <MAC> -- <fluxcast flags>")
+    if not flags:
+        die("no flags given. usage: tvmirror profile-set <MAC> -- --wfd-go-intent 15")
+    name = load_peers().get(mac.upper(), {}).get("name", "")
+    data = load_profiles()
+    data["by_mac"][mac.upper()] = {"name": name, "flags": flags, "learned": int(time.time())}
+    save_profiles(data)
+    ok(f"pinned for {name or mac.upper()}: {' '.join(flags)}")
+    return 0
+
+
+def cmd_profile_forget(mac: str | None) -> int:
+    if not mac:
+        die("usage: tvmirror profile-forget <MAC>")
+    data = load_profiles()
+    if data["by_mac"].pop(mac.upper(), None) is None:
+        info("no profile for that sink")
+        return 0
+    save_profiles(data)
+    ok(f"forgot profile for {mac.upper()}")
+    return 0
+
+
+def cmd_doctor(fresh: bool = False) -> int:
+    comp, backend = detect_compositor()
+    hdr("environment")
+    ok(f"compositor: {comp}")
+    ok(f"recommended capture backend: {backend}")
+    info(backend_note(comp))
+    black = capture_is_black() if backend != "x11grab" else None
+    if black is True:
+        bad("native capture is returning BLACK frames")
+    elif black is False:
+        ok("native capture returns real pixels")
+    print()
+    hdr("fluxcast doctor")
+    r = run_flux(["--doctor"], timeout=120)
+    parsed = parse_doctor(r.stdout)
+    if parsed and not any(st == "fail" for st, _ in parsed.values()):
+        _doctor_cache_store(parsed)
+    for line in r.stdout.splitlines():
+        m = re.match(r"\s{2,}(ok|warn|fail)\s{1,}(\S.*?)\s{2,}(.*)$", line)
+        if m:
+            st, name, det = m.group(1), m.group(2).strip(), m.group(3).strip()
+            (ok if st == "ok" else warn if st == "warn" else bad)(
+                f"{name}: {det[:100] if det else ''}")
+        else:
+            print(f"  {C.DIM}{line.strip()[:110]}{C.RESET}")
+    print()
+    hdr("encoders")
+    describe_encoders()
+    print()
+    info("stream with:  tvmirror run   (add --auto-fix for stubborn sinks)")
+    return 0
+
+
+def cmd_scan() -> int:
+    hdr("scanning for Miracast sinks")
+    peers = scan_peers()
+    if not peers:
+        bad("none found")
+        info("put the TV in screen-mirroring receive mode first (Miracast / Screen Share / Wireless Display)")
+        return 2
+    for p in peers:
+        wfd = f"{C.GREEN}WFD ok{C.RESET}" if p["wfd"] else f"{C.YELLOW}no WFD data{C.RESET}"
+        print(f"  {p['name']}  {p['mac']}  {wfd}")
+    return 0
+
+
+def cmd_list() -> int:
+    hdr("saved peers")
+    data = load_peers()
+    if not data:
+        info("none saved yet — they save automatically on connect")
+        return 0
+    for mac, meta in sorted(data.items(), key=lambda kv: -kv[1].get("last_used", 0)):
+        print(f"  {meta['name']}  {mac}")
+    return 0
+
+
+def cmd_backend() -> int:
+    comp, backend = detect_compositor()
+    print(f"{comp} → {backend}")
+    return 0
+
+
+def interactive() -> int:
+    """TUI: preflight, scan, pick, stream."""
+    clear = "\033[2J\033[H"
+    print(clear)
+    print(f"{C.MAGENTA}{C.BOLD}  tvmirror{C.RESET}  {C.DIM}cast this desktop to a TV{C.RESET}\n")
+    return do_run(mac=None, extra=[])
+
+
+def active_p2p_groups() -> list[str]:
+    """P2P group interfaces that are currently UP (an active Miracast link)."""
+    out = []
+    try:
+        for p in Path("/sys/class/net").iterdir():
+            if p.name.startswith("p2p-") or p.name.startswith("p2p-wlan"):
+                try:
+                    if p.joinpath("operstate").read_text().strip() == "up":
+                        out.append(p.name)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def active_fluxcast() -> list[int]:
+    """
+    PIDs of other running FluxCast senders (not us).
+
+    Match on the SCRIPT, not a fixed cmdline: users invoke it variously as
+    `src/main.py`, `main.py`, or via the tvmirror wrapper, and a narrow pattern
+    misses a live sender — which previously made this guard treat a HEALTHY
+    session as orphaned and tear down a working stream.
+    """
+    pids: list[int] = []
+    me = os.getpid()
+    try:
+        r = subprocess.run(["pgrep", "-f", "main.py"], capture_output=True, text=True)
+        for line in r.stdout.split():
+            try:
+                pid = int(line)
+            except ValueError:
+                continue
+            if pid == me:
+                continue
+            # confirm it really is FluxCast (avoid matching unrelated main.py)
+            try:
+                cl = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+            except OSError:
+                continue
+            low = cl.lower()
+            if "main.py" in low and ("fluxcast" in low or "protocol" in low
+                                     or "wfd" in low or "dlna" in low):
+                pids.append(pid)
+    except Exception:
+        pass
+    return pids
+
+
+def group_has_traffic(groups: list[str]) -> bool:
+    """
+    True if ANY p2p group is actively moving bytes. A live stream's tx counter
+    climbs; an orphaned group's stays flat. This is the deciding signal —
+    process detection alone is unreliable.
+    """
+    for g in groups:
+        tx = Path(f"/sys/class/net/{g}/statistics/tx_bytes")
+        try:
+            a = int(tx.read_text().strip())
+        except (OSError, ValueError):
+            continue
+        time.sleep(2.0)
+        try:
+            b = int(tx.read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if b - a > 4096:      # >4KB in 2s == real media flowing
+            return True
+    return False
+
+
+def teardown_stale_groups() -> None:
+    """Release an orphaned FluxCast WFD P2P connection left by a dead sender."""
+    try:
+        r = subprocess.run(["nmcli", "-t", "-f", "NAME,STATE", "connection", "show"],
+                           capture_output=True, text=True, timeout=25)
+        for line in r.stdout.splitlines():
+            if "FluxCast" in line and "activated" in line:
+                name = line.split(":")[0]
+                subprocess.run(["nmcli", "connection", "down", name],
+                               capture_output=True, timeout=25)
+                ok(f"released stale P2P connection '{name}'")
+                time.sleep(2)
+    except Exception:
+        pass
+
+
+def guard_single_sender() -> None:
+    """
+    Wi-Fi Direct permits exactly ONE P2P group at a time. A second sender
+    silently steals the group, so the TV accepts a connection that then dies —
+    presenting as 'I accept on the TV but nothing happens'.
+
+    Safety rule: NEVER tear down a group that is carrying traffic. An earlier
+    version judged by process detection alone and killed a HEALTHY 86MB stream
+    because it couldn't see the sender's cmdline. Traffic is the ground truth:
+    if bytes are moving, leave it alone and just warn.
+
+    Only ever called on a real connect attempt — never from scan/doctor.
+    """
+    groups = active_p2p_groups()
+    if not groups and not active_fluxcast():
+        return
+
+    hdr("existing session detected")
+    others = active_fluxcast()
+    live = group_has_traffic(groups) if groups else False
+
+    if live:
+        # Ground truth: media is flowing. Refuse to touch it.
+        bad("a session is actively streaming")
+        if groups:
+            info(f"active P2P group with traffic: {', '.join(groups)}")
+        if others:
+            info(f"sender pid(s): {', '.join(map(str, others))}")
+        info("stop it first:  " + (f"kill {' '.join(map(str, others))}" if others
+                                  else "close the other sender"))
+        die("refusing to disturb a live stream", 3)
+
+    if others:
+        bad(f"another FluxCast sender is running (pid {', '.join(map(str, others))})")
+        info("Wi-Fi Direct allows one group at a time — it would steal the link.")
+        info(f"stop it first:  kill {' '.join(map(str, others))}")
+        if groups:
+            die("P2P link busy — stop the other sender first", 3)
+        return
+
+    if groups:
+        warn(f"idle P2P group (no traffic): {', '.join(groups)}")
+        info("no sender and no bytes moving → genuinely orphaned; releasing")
+        teardown_stale_groups()
+        if active_p2p_groups():
+            bad("could not release it — do it manually:")
+            info("  nmcli connection down 'FluxCast WFD'")
+            die("P2P link busy", 3)
+        ok("P2P link is clear")
+
+
+# ------------------------------------------------------------------- main ----
+def main() -> int:
+    # `profile-set <MAC> [--] <flags...>` takes arbitrary dash-flags, which the
+    # generic parser below would try to interpret. Handle it before argparse.
+    if sys.argv[1:2] == ["profile-set"]:
+        rest = sys.argv[2:]
+        mac = rest[0] if rest else None
+        flags = rest[rest.index("--") + 1:] if "--" in rest else rest[1:]
+        return cmd_profile_set(mac, flags)
+
+    ap = argparse.ArgumentParser(
+        prog="tvmirror",
+        description="Cast a Linux desktop to a TV over Miracast/WFD.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split("Modes:")[-1].strip() if __doc__ else None,
+    )
+    ap.add_argument("cmd", nargs="?", choices=[
+        "run", "doctor", "scan", "test", "list", "save", "backend", "display",
+        "profile", "profile-set", "profile-forget"],
+        help="run (default), doctor, scan, test, list, save, backend, display, profile*")
+    ap.add_argument("mac", nargs="?", help="peer MAC for `save`, or --peer for run")
+    ap.add_argument("name", nargs="?", help="friendly name for `save`")
+    ap.add_argument("--peer", help="connect to this MAC without scanning prompt")
+    ap.add_argument("--latency-log", action="store_true", help="JSONL latency/session log")
+    ap.add_argument("--dry-run", action="store_true", help="preflight + scan only")
+    ap.add_argument("--fps", type=int, help="capture fps (lower = less CPU/bandwidth)")
+    ap.add_argument("--bitrate", help="video bitrate, e.g. 8M")
+    ap.add_argument("--scale", help="scale output to WxH, e.g. 1280x720")
+    ap.add_argument("--pipeline", choices=["auto", "ffmpeg", "gst"],
+                    help="media pipeline (ffmpeg uses x11grab — black on Hyprland)")
+    ap.add_argument("--no-audio", action="store_true", help="video only")
+    ap.add_argument("--create-display", action="store_true",
+                    help="ensure a Hyprland virtual display before streaming")
+    ap.add_argument("--width", type=int, default=1920, help="virtual display width")
+    ap.add_argument("--height", type=int, default=1080, help="virtual display height")
+    ap.add_argument("--refresh", type=int, default=60, help="virtual display refresh")
+    ap.add_argument("--remove", action="store_true", help="`display --remove` cleanup")
+    ap.add_argument("--auto-fix", action="store_true",
+                    help="retry with known sink workarounds if the session dies early")
+    ap.add_argument("--rescan", action="store_true",
+                    help="scan even when --peer/--last is given")
+    ap.add_argument("--last", action="store_true", help="use the most recently used sink")
+    ap.add_argument("--fresh", action="store_true", help="ignore the cached doctor report")
+    ap.add_argument("--encoder", choices=["auto", "x264", "vaapi", "nvenc"],
+                    help="H.264 encoder (hardware needs a FluxCast build with --wfd-encoder)")
+    # NOTE: argparse.REMAINDER swallows everything after the first positional,
+    # so `tvmirror display --remove` would put --remove in `extra` and silently
+    # ignore it. Pre-scan argv and pull our own flags out before parsing.
+    our_flags = {"--remove", "--create-display", "--width", "--height", "--refresh",
+                 "--fps", "--bitrate", "--scale", "--pipeline", "--no-audio",
+                 "--peer", "--latency-log", "--dry-run", "--auto-fix", "--rescan",
+                 "--last", "--fresh", "--encoder"}
+    SUBCOMMANDS = {"run", "doctor", "scan", "test", "list", "save", "backend",
+                   "display", "profile", "profile-set", "profile-forget"}
+    pre: list[str] = []
+    passthrough: list[str] = []
+    i = 0
+    argv = sys.argv[1:]
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            passthrough = argv[i + 1:]
+            break
+        if tok in SUBCOMMANDS:
+            # Our own subcommand — keep it for argparse, never forward it.
+            pre.append(tok)
+        elif tok in our_flags:
+            pre.append(tok)
+            # flags that take a value
+            if tok in {"--width", "--height", "--refresh", "--fps",
+                       "--bitrate", "--scale", "--pipeline", "--peer", "--encoder"}:
+                if i + 1 < len(argv):
+                    pre.append(argv[i + 1])
+                    i += 1
+        else:
+            passthrough.append(tok)
+        i += 1
+
+    ap.add_argument("extra", nargs=argparse.REMAINDER, help="extra flags → fluxcast")
+    a = ap.parse_args(pre + passthrough)
+    # Anything of ours that followed the positional wins over passthrough defaults.
+    for name in ("--remove", "--create-display", "--no-audio", "--latency-log", "--dry-run",
+                 "--auto-fix", "--rescan", "--last", "--fresh"):
+        if name in pre:
+            setattr(a, name.replace("--", "").replace("-", "_"), True)
+    for name, attr in (("--width", "width"), ("--height", "height"),
+                       ("--refresh", "refresh"), ("--fps", "fps"),
+                       ("--bitrate", "bitrate"), ("--scale", "scale"),
+                       ("--pipeline", "pipeline"), ("--peer", "peer"),
+                       ("--encoder", "encoder")):
+        if name in pre:
+            val = pre[pre.index(name) + 1]
+            if attr in ("width", "height", "refresh", "fps"):
+                setattr(a, attr, int(val))
+            else:
+                setattr(a, attr, val)
+    # `passthrough` holds only tokens meant for FluxCast (subcommands and our
+    # own flags were filtered out above), so it IS the passthrough list.
+    a.extra = passthrough
+
+    # Map our ergonomic flags onto FluxCast's equivalents.
+    tuned: list[str] = []
+    if a.fps is not None:
+        tuned += ["--fps", str(a.fps)]
+    if a.bitrate:
+        tuned += ["--bitrate", str(a.bitrate)]
+    if a.scale:
+        tuned += ["--resolution", str(a.scale)]
+    if a.pipeline:
+        tuned += ["--wfd-media-pipeline", a.pipeline]
+    if a.no_audio:
+        tuned += ["--wfd-no-audio"]
+    if a.encoder and a.encoder != "x264":
+        if a.cmd in ("run", "test", None) and not flux_supports("--wfd-encoder"):
+            warn("this FluxCast build has no --wfd-encoder; staying on x264")
+        else:
+            tuned += ["--wfd-encoder", a.encoder]
+    a.tuned = tuned
+    if a.last and not a.peer:
+        lp = last_peer()
+        if lp:
+            a.peer = lp[0]
+        else:
+            warn("--last: no saved sink yet")
+
+    if a.cmd == "doctor":
+        return cmd_doctor(fresh=a.fresh)
+    if a.cmd == "profile":
+        return cmd_profile()
+    if a.cmd == "profile-set":
+        return cmd_profile_set(a.mac, a.extra)
+    if a.cmd == "profile-forget":
+        return cmd_profile_forget(a.mac)
+    if a.cmd == "scan":
+        return cmd_scan()
+    if a.cmd == "list":
+        return cmd_list()
+    if a.cmd == "backend":
+        return cmd_backend()
+    if a.cmd == "display":
+        if not (a.create_display or a.remove) and not headless_outputs():
+            a.create_display = True
+        return cmd_display(a)
+    if a.cmd == "save":
+        if not a.mac:
+            die("usage: tvmirror save <MAC> [name]")
+        save_peer(a.mac, a.name or a.mac)
+        return 0
+    if a.cmd == "test":
+        return do_run(a.peer, a.extra + a.tuned, test_pattern=True, dry=a.dry_run,
+                      rescan=a.rescan, fresh=a.fresh)
+    if a.cmd == "run":
+        if a.create_display:
+            hdr("virtual display")
+            n = ensure_headless(a.width, a.height, a.refresh)
+            if not n:
+                die("could not prepare a virtual display", 4)
+            info(f"select '{n}' in the portal dialog (NOT the laptop panel)")
+            print()
+        return do_run(a.peer, a.extra + a.tuned, latency_log=a.latency_log,
+                      dry=a.dry_run, auto_fix=a.auto_fix, rescan=a.rescan,
+                      fresh=a.fresh)
+    return interactive()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print(f"\n{C.DIM}interrupted{C.RESET}")
+        sys.exit(130)

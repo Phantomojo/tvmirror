@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+# Private/local runtime data (never commit peers, profiles, doctor cache)
+cfg/
+config/
+cache/
+*.local.json
+# Editors
+.vscode/
+.idea/
